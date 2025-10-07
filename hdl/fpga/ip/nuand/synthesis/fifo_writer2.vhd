@@ -1,0 +1,390 @@
+-- Copyright (c) 2025 MyTechCatalog LLC
+-- Copyright (c) 2017 Nuand LLC
+--
+-- Permission is hereby granted, free of charge, to any person obtaining a copy
+-- of this software and associated documentation files (the "Software"), to deal
+-- in the Software without restriction, including without limitation the rights
+-- to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-- copies of the Software, and to permit persons to whom the Software is
+-- furnished to do so, subject to the following conditions:
+--
+-- The above copyright notice and this permission notice shall be included in
+-- all copies or substantial portions of the Software.
+--
+-- THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-- IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-- FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-- AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-- LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+-- THE SOFTWARE.
+
+library ieee;
+    use ieee.std_logic_1164.all;
+    use ieee.numeric_std.all;
+
+library work;
+    use work.fifo_readwrite_p.all;
+
+entity fifo_writer2 is
+    generic (
+        FIFO_USEDW_WIDTH      : natural := 12;
+        FIFO_DATA_WIDTH       : natural := 32;
+        META_FIFO_USEDW_WIDTH : natural := 5;
+        META_FIFO_DATA_WIDTH  : natural := 128
+    );
+    port (
+        clock               :   in      std_logic;
+        reset               :   in      std_logic;
+        enable              :   in      std_logic;
+
+        usb_speed           :   in      std_logic;
+        meta_en             :   in      std_logic;
+        packet_en           :   in      std_logic;
+        timestamp           :   in      unsigned(63 downto 0);
+        mini_exp            :   in      std_logic_vector(1 downto 0);
+
+        fifo_usedw          :   in      std_logic_vector(FIFO_USEDW_WIDTH-1 downto 0);
+        fifo_clear          :   buffer  std_logic;
+        fifo_write          :   buffer  std_logic := '0';
+        fifo_full           :   in      std_logic;
+        fifo_data           :   out     std_logic_vector(FIFO_DATA_WIDTH-1 downto 0) := (others => '0');
+
+        packet_control      :   in      packet_control_t;
+        packet_ready        :   out     std_logic;
+
+        meta_fifo_full      :   in     std_logic;
+        meta_fifo_usedw     :   in     std_logic_vector(META_FIFO_USEDW_WIDTH-1 downto 0);
+        meta_fifo_data      :   out    std_logic_vector(META_FIFO_DATA_WIDTH-1 downto 0) := (others => '0');
+        meta_fifo_write     :   out    std_logic := '0';
+
+        overflow_led        :   buffer  std_logic;
+        overflow_count      :   buffer  unsigned(63 downto 0);
+        overflow_duration   :   in      unsigned(15 downto 0)
+    );
+end entity;
+
+architecture simple of fifo_writer2 is
+
+    constant DMA_BUF_SIZE_SS   : natural   := 512;
+    constant DMA_BUF_SIZE_HS   : natural   := 256;
+    constant NUM_STREAMS       : natural   := fifo_data'length/(packet_control.data'length);
+
+    signal dma_buf_size        : natural range DMA_BUF_SIZE_HS to DMA_BUF_SIZE_SS := DMA_BUF_SIZE_SS;
+
+    signal fifo_enough         : boolean   := false;
+    signal overflow_detected   : std_logic := '0';
+
+    type meta_state_t is (
+        IDLE,
+        PACKET_WAIT_EOP
+    );
+
+    type meta_fsm_t is record
+        state           : meta_state_t;
+        dma_downcount   : natural range 0 to 65536;
+        meta_write      : std_logic;
+        meta_data       : std_logic_vector(meta_fifo_data'range);
+        meta_written    : std_logic;
+    end record;
+
+    constant META_FSM_RESET_VALUE : meta_fsm_t := (
+        state           => IDLE,
+        dma_downcount   => 0,
+        meta_write      => '0',
+        meta_data       => (others => '-'),
+        meta_written    => '0'
+    );
+
+    signal meta_current : meta_fsm_t := META_FSM_RESET_VALUE;
+    signal meta_future  : meta_fsm_t := META_FSM_RESET_VALUE;
+
+    type fifo_state_t is (
+        CLEAR,
+        WRITE_PACKET_PAYLOAD
+    );
+
+    type ch_offsets_t is array( natural range <> ) of natural range fifo_data'low to fifo_data'high;
+
+    type fifo_fsm_t is record
+        state               : fifo_state_t;
+        fifo_clear          : std_logic;
+        fifo_write          : std_logic;
+        fifo_data           : unsigned(fifo_data'range);
+        samples_left        : natural range 0 to NUM_STREAMS;
+    end record;
+
+    constant FIFO_FSM_RESET_VALUE : fifo_fsm_t := (
+        state               => CLEAR,
+        fifo_clear          => '1',
+        fifo_write          => '0',
+        fifo_data           => (others => '-'),
+        samples_left        => 0
+    );
+
+    signal fifo_current : fifo_fsm_t := FIFO_FSM_RESET_VALUE;
+    signal fifo_future  : fifo_fsm_t := FIFO_FSM_RESET_VALUE;
+
+    signal sync_mini_exp: std_logic_vector(1 downto 0);
+
+begin
+    
+    overflow_led <= '0';
+    overflow_count <= (others =>'0');
+
+    -- Throw an error if port widths don't make sense
+    assert (fifo_data'length >= (2*packet_control.data'length) )
+        report "fifo_data port width too narrow to support " & integer'image(packet_control.data'length) & " packet control data width."
+        severity failure;
+    
+    -- Determine the DMA buffer size based on USB speed
+    calc_buf_size : process( clock, reset )
+    begin
+        if( reset = '1' ) then
+            dma_buf_size <= DMA_BUF_SIZE_SS;
+        elsif( rising_edge(clock) ) then
+            if( usb_speed = '0' ) then
+                dma_buf_size <= DMA_BUF_SIZE_SS;
+            else
+                dma_buf_size <= DMA_BUF_SIZE_HS;
+            end if;
+        end if;
+    end process;
+
+    -- Calculate whether there's enough room in the destination FIFO
+    calc_fifo_free : process( clock, reset )
+        constant FIFO_MAX    : natural := 2**fifo_usedw'length;
+        constant META_MAX    : natural := 2**meta_fifo_usedw'length;
+        variable fifo_used_v : unsigned(fifo_usedw'length downto 0) := (others => '0');
+        variable meta_fifo_used_v : unsigned(meta_fifo_usedw'length downto 0) := (others => '0');
+    begin
+        if( reset = '1' ) then
+            fifo_enough <= false;
+            fifo_used_v := (others => '0');
+        elsif( rising_edge(clock) ) then
+            fifo_used_v := unsigned(fifo_full & fifo_usedw);
+            meta_fifo_used_v := unsigned(meta_fifo_full & meta_fifo_usedw);
+            if( fifo_full = '0' and ((FIFO_MAX - fifo_used_v) > ( dma_buf_size * 4 )) and
+                 ( ( meta_en = '1' and meta_fifo_full = '0' and ( META_MAX - 4 ) > meta_fifo_used_v )
+                   or (meta_en = '0') ) ) then
+                fifo_enough <= true;
+            else
+                fifo_enough <= false;
+            end if;
+        end if;
+    end process;
+
+    -- ------------------------------------------------------------------------
+    -- MINI EXP PIN SYNCHRONIZER
+    -- ------------------------------------------------------------------------
+    generate_sync_mimo_rx_en : for i in mini_exp'range generate
+        U_sync_mini_exp : entity work.synchronizer
+            generic map (
+                RESET_LEVEL         =>  '0'
+                )
+            port map (
+                reset               =>  '0',
+                clock               =>  clock,
+                async               =>  mini_exp(i),
+                sync                =>  sync_mini_exp(i)
+            );
+    end generate;
+
+    -- ------------------------------------------------------------------------
+    -- META FIFO WRITER
+    -- ------------------------------------------------------------------------
+
+    -- Meta FIFO synchronous process
+    meta_fsm_sync : process( clock, reset )
+    begin
+        if( reset = '1' ) then
+            meta_current <= META_FSM_RESET_VALUE;
+        elsif( rising_edge(clock) ) then
+            meta_current <= meta_future;
+        end if;
+    end process;
+
+    packet_ready <= '1' when fifo_enough else '0';
+
+    -- Meta FIFO combinatorial process
+    meta_fsm_comb : process( all )
+        variable packet_flags : std_logic_vector(7 downto 0);
+    begin
+
+        meta_future            <= meta_current;
+
+        meta_future.meta_write <= '0';
+        -- currently the GPIF modules overwrites the bottom 16 bits of the flags field
+        if( packet_en = '0' ) then
+           meta_future.meta_data  <= x"FFF" & "11" & sync_mini_exp & x"FFFF" & std_logic_vector(timestamp) & x"12344321";
+        else
+           packet_flags := packet_control.pkt_flags;
+           meta_future.meta_data  <= x"FFF" & "11" & sync_mini_exp & x"FFFF" & std_logic_vector(timestamp) &
+                          packet_control.pkt_core_id & packet_flags &
+                          std_logic_vector(to_unsigned(integer(meta_current.dma_downcount), 16));
+        end if;
+
+
+        case meta_current.state is
+            when IDLE =>
+
+                meta_future.dma_downcount <= dma_buf_size - 4;
+
+                if( fifo_enough ) then
+                    if( packet_en = '1' ) then
+                       -- use downcount to count number of DWORDS for packets
+
+                       if( packet_control.pkt_sop = '1' ) then
+                          meta_future.state  <= PACKET_WAIT_EOP;
+
+                          -- meta is not written yet, but there should be space
+                          meta_future.meta_written <= '1';
+
+                          -- EOP and VALID must be asserted together, count the last VALID now
+                          if( packet_control.data_valid = '1') then
+                             meta_future.dma_downcount <= 2;
+                          else
+                             meta_future.dma_downcount <= 1;
+                          end if;
+                       end if;                   
+                    end if;
+                else
+                    meta_future.meta_written <= '0';
+                end if;
+
+            when PACKET_WAIT_EOP =>
+
+                if( packet_control.data_valid = '1' ) then
+                   meta_future.dma_downcount <= meta_current.dma_downcount + 1;
+
+                   if( packet_control.pkt_eop = '1' ) then
+                       meta_future.meta_write  <= '1';
+                       meta_future.state       <= IDLE;
+                   end if;
+                end if;
+
+            when others =>
+
+                meta_future.state <= IDLE;
+
+        end case;
+
+        -- Abort?
+        if( (enable = '0') or (meta_en = '0') ) then
+            meta_future.meta_write    <= '0';
+            meta_future.meta_written  <= '0';
+            meta_future.state         <= IDLE;
+        end if;
+
+        -- Output assignments
+        meta_fifo_write <= meta_current.meta_write;
+        meta_fifo_data  <= meta_current.meta_data;
+
+    end process;
+
+
+    -- ------------------------------------------------------------------------
+    -- SAMPLE FIFO WRITER
+    -- ------------------------------------------------------------------------
+
+    -- Sample FIFO synchronous process
+    fifo_fsm_sync : process( clock, reset )
+    begin
+        if( reset = '1' ) then
+            fifo_current <= FIFO_FSM_RESET_VALUE;
+        elsif( rising_edge(clock) ) then
+            fifo_current <= fifo_future;
+        end if;
+    end process;
+
+    -- Sample FIFO combinatorial process
+    fifo_fsm_comb : process( all )
+        variable write_req : std_logic := '0';
+
+    begin
+
+        fifo_future            <= fifo_current;
+
+        fifo_future.fifo_clear <= '0';
+        fifo_future.fifo_write <= '0';
+
+        case fifo_current.state is
+
+            when CLEAR =>
+                --   Compute "samples left" to fill up the fifo_data bus
+                fifo_future.samples_left      <= 0;
+
+                if( enable = '1' ) then
+                    fifo_future.fifo_clear <= '0';
+                    if( packet_en = '1' ) then
+                       fifo_future.state      <= WRITE_PACKET_PAYLOAD;
+                       fifo_future.samples_left <= NUM_STREAMS - 1;
+                    end if;
+                else
+                    fifo_future.fifo_clear <= '1';
+                end if;
+
+            when WRITE_PACKET_PAYLOAD =>
+
+                if( meta_current.meta_written = '1' or (fifo_enough and packet_control.pkt_sop = '1' )) then
+                    -- This code converts DWORD packet data into a fifo_data std_logic_vector
+                    -- that is controlled by a generic.
+                    if( packet_control.data_valid = '1' ) then
+                        if( packet_control.pkt_eop = '1' and fifo_current.samples_left /= 0 ) then
+                           -- End of packet asserted, however fifo_data is not full so
+                           -- zero out the unset bits, commit what has been accumulated
+                           fifo_future.samples_left <= NUM_STREAMS - 1;
+                           fifo_future.fifo_write <= '1';
+
+                           if (fifo_current.fifo_data'high > 31) then
+                               fifo_future.fifo_data(fifo_future.fifo_data'high
+                                           downto fifo_future.fifo_data'high - 31) <= (others => '0');
+                           end if;
+                           fifo_future.fifo_data(31 downto 0) <= unsigned(packet_control.data);
+                        elsif( fifo_current.samples_left = 0 ) then
+                           -- DWORDs perfectly filled fifo_data, commit fifo_data
+                           fifo_future.samples_left <= NUM_STREAMS - 1;
+                           fifo_future.fifo_write <= '1';
+
+                           if (fifo_current.fifo_data'high > 31) then
+                              fifo_future.fifo_data <= unsigned(packet_control.data) &
+                                 fifo_current.fifo_data(fifo_current.fifo_data'high downto 32);
+                           else
+                              fifo_future.fifo_data <= unsigned(packet_control.data);
+                           end if;
+                        else
+                           fifo_future.fifo_data(fifo_future.fifo_data'high
+                                       downto fifo_future.fifo_data'high - 31) <=
+                                             unsigned(packet_control.data);
+
+                           if (fifo_current.fifo_data'high > 31) then
+                               fifo_future.fifo_data(fifo_future.fifo_data'high - 32 downto 0) <=
+                                        (others => '0');
+                           end if;
+                           fifo_future.samples_left <= fifo_current.samples_left - 1;
+                        end if;
+
+                    end if;
+                end if;
+
+            when others =>
+
+                fifo_future.state <= CLEAR;
+
+        end case;
+
+        -- Abort?
+        if( enable = '0' ) then
+            fifo_future.fifo_clear <= '1';
+            fifo_future.fifo_write <= '0';
+            fifo_future.state      <= CLEAR;
+        end if;
+
+        -- Output assignments
+        fifo_clear <= fifo_current.fifo_clear;
+        fifo_write <= fifo_current.fifo_write;
+        fifo_data  <= std_logic_vector(fifo_current.fifo_data);
+
+    end process;
+
+end architecture;
