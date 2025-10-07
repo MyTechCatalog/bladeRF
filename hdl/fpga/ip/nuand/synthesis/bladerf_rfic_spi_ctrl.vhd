@@ -117,9 +117,9 @@ begin
         mm_busy      => mm_busy
       );
 
-    sync_proc : process(clock)
+    sync_proc : process(clock, reset)
     begin
-        if(reset = '1') then
+        if (reset = '1') then
             current <= reset_value;
         elsif(rising_edge(clock)) then
             current <= future;
