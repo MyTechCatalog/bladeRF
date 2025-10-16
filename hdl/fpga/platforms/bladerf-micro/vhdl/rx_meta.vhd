@@ -27,7 +27,7 @@ library work;
     use work.bladerf_p.all;
     use work.fifo_readwrite_p.all;
 
-entity rx_meta is    
+entity rx_meta is
     port (
         rx_reset               : in    std_logic;
         rx_clock               : in    std_logic;

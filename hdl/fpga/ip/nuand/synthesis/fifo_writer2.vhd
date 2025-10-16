@@ -25,6 +25,7 @@ library ieee;
 
 library work;
     use work.fifo_readwrite_p.all;
+    use work.fx3_gpif_p.all;
 
 entity fifo_writer2 is
     generic (
@@ -66,8 +67,8 @@ end entity;
 
 architecture simple of fifo_writer2 is
 
-    constant DMA_BUF_SIZE_SS   : natural   := 512;
-    constant DMA_BUF_SIZE_HS   : natural   := 256;
+    constant DMA_BUF_SIZE_SS   : natural   := GPIF_BUF_SIZE_SS;
+    constant DMA_BUF_SIZE_HS   : natural   := GPIF_BUF_SIZE_HS;
     constant NUM_STREAMS       : natural   := fifo_data'length/(packet_control.data'length);
 
     signal dma_buf_size        : natural range DMA_BUF_SIZE_HS to DMA_BUF_SIZE_SS := DMA_BUF_SIZE_SS;
@@ -127,6 +128,9 @@ architecture simple of fifo_writer2 is
 
     signal sync_mini_exp: std_logic_vector(1 downto 0);
 
+    signal meta_fifo_used_v_r : unsigned(meta_fifo_usedw'length downto 0) := (others => '0');
+    signal fifo_used_v_r      : unsigned(fifo_usedw'length downto 0) := (others => '0');
+
 begin
     
     overflow_led <= '0';
@@ -161,11 +165,21 @@ begin
         if( reset = '1' ) then
             fifo_enough <= false;
             fifo_used_v := (others => '0');
+            meta_fifo_used_v_r <= (others => '0');
+            fifo_used_v_r <= (others => '0');
         elsif( rising_edge(clock) ) then
+            -- the outputs of the dcfifo are not registered so give the long combinatorial
+            -- data path, let's register the values. one extra clock cycle will not change
+            -- the fidelity of the result. the meta_fifo represents at minimum 204 timestamps.
+            -- there is no way for an off by 1 clock cycle timing to overflow the meta fifo
+            -- when the buffer leaves 4 full meta buffers empty
             fifo_used_v := unsigned(fifo_full & fifo_usedw);
+            fifo_used_v_r <= fifo_used_v;
             meta_fifo_used_v := unsigned(meta_fifo_full & meta_fifo_usedw);
-            if( fifo_full = '0' and ((FIFO_MAX - fifo_used_v) > ( dma_buf_size * 4 )) and
-                 ( ( meta_en = '1' and meta_fifo_full = '0' and ( META_MAX - 4 ) > meta_fifo_used_v )
+            meta_fifo_used_v_r <= meta_fifo_used_v;
+
+            if( fifo_full = '0' and ((FIFO_MAX - fifo_used_v_r) > ( dma_buf_size )) and
+                ( ( meta_en = '1' and meta_fifo_full = '0' and ( META_MAX - 4 ) > meta_fifo_used_v_r )
                    or (meta_en = '0') ) ) then
                 fifo_enough <= true;
             else
@@ -246,12 +260,12 @@ begin
                           else
                              meta_future.dma_downcount <= 1;
                           end if;
-                       end if;                   
+                       end if;
                     end if;
                 else
                     meta_future.meta_written <= '0';
                 end if;
-
+                
             when PACKET_WAIT_EOP =>
 
                 if( packet_control.data_valid = '1' ) then
