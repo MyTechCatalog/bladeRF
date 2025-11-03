@@ -4,8 +4,8 @@ library ieee;
     use ieee.math_real.all;
 
 library work;
-    use work.constellation_mapper_p.all;
-
+    use work.signal_processing_p.all;
+    
 entity fir_filter is
     generic (
         INPUT_WIDTH : positive := 16;
@@ -17,7 +17,7 @@ entity fir_filter is
         H : real_array_t := (1.0, 0.0 ,1.0);
 
         ACCUM_SCALE : positive := 32;
-        OUTPUT_SHIFT : positive := 12
+        OUTPUT_SHIFT : natural := 12
 
     );
     port(
@@ -41,25 +41,24 @@ architecture systolic of fir_filter is
     begin
         return resize(shift_right(a*b,Q),a'length);
     end function;
-
-    --integer(ceil(log2( real(H'length*(2**(INPUT_WIDTH-1))) )))
+    
     type accum_t is array( natural range <>) of signed( ACCUM_SCALE-1 downto 0);
     signal accum : accum_t(H'range);
 
 
-    type coeff_t is array( natural range <>) of signed( (INPUT_WIDTH-1 ) downto 0);
+    type coeff_t is array( natural range <>) of signed( Q downto 0);
     signal coeff : coeff_t(H'range);
 
-    function scale_coeffecients (h : real_array_t; q : positive) return coeff_t is
+    function scale_coefficients (h : real_array_t; q : positive) return coeff_t is
         variable retval : coeff_t(h'range);
     begin
         for i in h'range loop
-            retval(i) := to_signed( integer(round(h(i) * real(2**q))), OUTPUT_WIDTH);
+            retval(i) := to_signed( integer(round(h(i) * real(2**q))), Q+1);
         end loop;
         return retval;
     end function;
 
-    constant COEF : coeff_t(H'range) :=  scale_coeffecients(H,Q);
+    constant COEF : coeff_t(H'range) :=  scale_coefficients(H,Q);
 
 begin
 
