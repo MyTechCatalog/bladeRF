@@ -55,10 +55,10 @@ static void _clear_rffe_ctrl()
     reg = rffe_csr_read();
     reg &= ~(1 << RFFE_CONTROL_TXNRX);
     reg &= ~(1 << RFFE_CONTROL_ENABLE);
-    reg &= ~(1 << RFFE_CONTROL_RX_SPDT_1);
-    reg &= ~(1 << RFFE_CONTROL_RX_SPDT_2);
-    reg &= ~(1 << RFFE_CONTROL_TX_SPDT_1);
-    reg &= ~(1 << RFFE_CONTROL_TX_SPDT_2);
+    reg &= ~(RFFE_CONTROL_SPDT_MASK << RFFE_CONTROL_RX_SPDT_1);
+    reg &= ~(RFFE_CONTROL_SPDT_MASK << RFFE_CONTROL_RX_SPDT_2);
+    reg &= ~(RFFE_CONTROL_SPDT_MASK << RFFE_CONTROL_TX_SPDT_1);
+    reg &= ~(RFFE_CONTROL_SPDT_MASK << RFFE_CONTROL_TX_SPDT_2);
     reg &= ~(1 << RFFE_CONTROL_MIMO_RX_EN_0);
     reg &= ~(1 << RFFE_CONTROL_MIMO_TX_EN_0);
     reg &= ~(1 << RFFE_CONTROL_MIMO_RX_EN_1);
@@ -84,6 +84,142 @@ static void _reset_rfic(bool state)
     }
 
     rffe_csr_write(reg);
+}
+
+/**
+ * @brief      Reset saved TX recalibration guard state
+ */
+static void _rfic_tx_recal_reset(struct rfic_tx_recal_state *tx_recal)
+{
+    tx_recal->tx_spdt_bits         = 0;
+    tx_recal->tx_frequency         = 0;
+    tx_recal->tx_port              = 0;
+    tx_recal->restore_tx_frequency = false;
+    tx_recal->restore_tx_port      = false;
+}
+
+/**
+ * @brief      Disconnect the external TX SPDT paths
+ */
+static void _rfic_tx_recal_disable_tx_spdt(
+    struct rfic_tx_recal_state *tx_recal)
+{
+    uint32_t reg;
+    uint32_t const tx_spdt_mask =
+        (RFFE_CONTROL_SPDT_MASK << RFFE_CONTROL_TX_SPDT_1) |
+        (RFFE_CONTROL_SPDT_MASK << RFFE_CONTROL_TX_SPDT_2);
+
+    reg                    = rffe_csr_read();
+    tx_recal->tx_spdt_bits = reg & tx_spdt_mask;
+
+    if (0 != tx_recal->tx_spdt_bits) {
+        rffe_csr_write(reg & ~tx_spdt_mask);
+    }
+}
+
+/**
+ * @brief      Restore the external TX SPDT paths
+ */
+static void _rfic_tx_recal_restore_tx_spdt(
+    struct rfic_tx_recal_state *tx_recal)
+{
+    uint32_t reg;
+    uint32_t const tx_spdt_mask =
+        (RFFE_CONTROL_SPDT_MASK << RFFE_CONTROL_TX_SPDT_1) |
+        (RFFE_CONTROL_SPDT_MASK << RFFE_CONTROL_TX_SPDT_2);
+
+    if (0 != tx_recal->tx_spdt_bits) {
+        reg = rffe_csr_read();
+        reg &= ~tx_spdt_mask;
+        reg |= tx_recal->tx_spdt_bits;
+        rffe_csr_write(reg);
+    }
+}
+
+/**
+ * @brief      Restore TX state after a guarded recalibration update
+ */
+static bool _rfic_tx_recal_finish(struct rfic_state *state)
+{
+    struct rfic_tx_recal_state *tx_recal = &state->tx_recal;
+    bool ok                              = true;
+    int status;
+
+    if (tx_recal->restore_tx_frequency) {
+        status = ad9361_set_tx_lo_freq(state->phy, tx_recal->tx_frequency);
+        if (status < 0) {
+            RFIC_ERR("ad9361_set_tx_lo_freq", status);
+            ok = false;
+        }
+    }
+
+    if (tx_recal->restore_tx_port) {
+        status = ad9361_set_tx_rf_port_output(state->phy, tx_recal->tx_port);
+        if (status < 0) {
+            RFIC_ERR("ad9361_set_tx_rf_port_output", status);
+            ok = false;
+        }
+    }
+
+    _rfic_tx_recal_restore_tx_spdt(tx_recal);
+    _rfic_tx_recal_reset(tx_recal);
+
+    return ok;
+}
+
+/**
+ * @brief      Restore TX state after a failed guarded recalibration setup
+ */
+static bool _rfic_tx_recal_start_failed(struct rfic_state *state,
+                                        char const *step,
+                                        int status)
+{
+    RFIC_ERR(step, status);
+    _rfic_tx_recal_finish(state);
+    return false;
+}
+
+/**
+ * @brief      Move TX away from the external path before recalibration updates
+ */
+static bool _rfic_tx_recal_start(struct rfic_state *state)
+{
+    struct rfic_tx_recal_state *tx_recal = &state->tx_recal;
+    int status;
+
+    _rfic_tx_recal_reset(tx_recal);
+    _rfic_tx_recal_disable_tx_spdt(tx_recal);
+
+    status = ad9361_get_tx_lo_freq(state->phy, &tx_recal->tx_frequency);
+    if (status < 0) {
+        return _rfic_tx_recal_start_failed(
+            state, "ad9361_get_tx_lo_freq", status);
+    }
+    tx_recal->restore_tx_frequency = true;
+
+    status = ad9361_get_tx_rf_port_output(state->phy, &tx_recal->tx_port);
+    if (status < 0) {
+        return _rfic_tx_recal_start_failed(
+            state, "ad9361_get_tx_rf_port_output", status);
+    }
+    tx_recal->restore_tx_port = true;
+
+    status = ad9361_set_tx_rf_port_output(state->phy, AD936X_TXB);
+    if (status < 0) {
+        return _rfic_tx_recal_start_failed(
+            state, "ad9361_set_tx_rf_port_output", status);
+    }
+
+    status = ad9361_set_tx_lo_freq(
+        state->phy, bladerf2_tx_frequency_range.max);
+    if (status < 0) {
+        return _rfic_tx_recal_start_failed(
+            state, "ad9361_set_tx_lo_freq", status);
+    }
+
+    usleep(1000);
+
+    return true;
 }
 
 
@@ -526,6 +662,7 @@ bool _rfic_cmd_wr_frequency(struct rfic_state *state,
 {
     bladerf_direction dir =
         BLADERF_CHANNEL_IS_TX(channel) ? BLADERF_TX : BLADERF_RX;
+    bladerf_channel port_ch = channel;
     bladerf_channel other_ch;
     uint32_t reg;
     size_t i;
@@ -541,12 +678,15 @@ bool _rfic_cmd_wr_frequency(struct rfic_state *state,
         /* Update SPDT bits accordingly */
         CHECK_BOOL(
             _modify_spdt_bits_by_freq(&reg, other_ch, enable, frequency));
+        if (enable) {
+            port_ch = other_ch;
+        }
     }
 
     rffe_csr_write(reg);
 
     CHECK_BOOL(set_ad9361_port_by_freq(
-        state->phy, channel, _rffe_ch_enabled(reg, channel), frequency));
+        state->phy, port_ch, _rffe_ch_enabled(reg, port_ch), frequency));
 
     if (BLADERF_CHANNEL_IS_TX(channel)) {
         CHECK_BOOL(ad9361_set_tx_lo_freq(state->phy, frequency));
@@ -1015,6 +1155,29 @@ bool _rfic_cmd_wr_fastlock(struct rfic_state *state,
     }
 
     return true;
+}
+
+/**
+ * @brief       Start or finish the TX recalibration guard
+ *
+ * @param[in]   action  BLADERF_RFIC_TX_RECAL_START or
+ *                      BLADERF_RFIC_TX_RECAL_FINISH
+ *
+ * @return      true if successful, false if not
+ */
+bool _rfic_cmd_wr_tx_recal(struct rfic_state *state,
+                           bladerf_channel channel,
+                           uint32_t action)
+{
+    switch ((bladerf_rfic_tx_recal)action) {
+        case BLADERF_RFIC_TX_RECAL_START:
+            return _rfic_tx_recal_start(state);
+
+        case BLADERF_RFIC_TX_RECAL_FINISH:
+            return _rfic_tx_recal_finish(state);
+    }
+
+    return false;
 }
 
 #endif  // defined(BOARD_BLADERF_MICRO) && defined(BLADERF_NIOS_LIBAD936X)
